@@ -91,9 +91,9 @@ namespace Agatha.ServiceLayer
 
 		private void RegisterRequestHandlers()
 		{
-			var oneWayHandlerType = typeof(OneWayRequestHandler);
+			var oneWayHandlerType = typeof(IOneWayRequestHandler);
 			var openOneWayHandlerType = typeof(IOneWayRequestHandler<>);
-			var requestResponseHandlerType = typeof(RequestHandler);
+			var requestResponseHandlerType = typeof(IRequestHandler);
 			var openRequestReponseHandlerType = typeof(IRequestHandler<>);
 
 			Dictionary<Type, Type> requestWithRequestHandlers = new Dictionary<Type, Type>();
@@ -101,10 +101,10 @@ namespace Agatha.ServiceLayer
 			{
 				foreach (var type in assembly.GetTypes())
 				{
-					if (type.IsAbstract)
+					if (type.IsAbstract || type.IsGenericType)
 						continue;
 
-					if (!type.IsSubclassOf(oneWayHandlerType) && !type.IsSubclassOf(requestResponseHandlerType))
+					if (!oneWayHandlerType.IsAssignableFrom(type) && !requestResponseHandlerType.IsAssignableFrom(type))
 						continue;
 
 					var requestType = GetRequestType(type);
@@ -112,11 +112,11 @@ namespace Agatha.ServiceLayer
 					if (requestType != null)
 					{
 						Type handlerType = null;
-						if (type.IsSubclassOf(oneWayHandlerType))
+						if (oneWayHandlerType.IsAssignableFrom(type))
 						{
 							handlerType = openOneWayHandlerType.MakeGenericType(requestType);
 						}
-						else if (type.IsSubclassOf(requestResponseHandlerType))
+						else if (requestResponseHandlerType.IsAssignableFrom(type))
 						{
 							handlerType = openRequestReponseHandlerType.MakeGenericType(requestType);
 						}

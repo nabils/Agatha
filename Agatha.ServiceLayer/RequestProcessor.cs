@@ -45,17 +45,20 @@ namespace Agatha.ServiceLayer
             BeforeProcessing(requests);
 
             var processingContexts = requests.Select(request => new RequestProcessingContext(request)).ToList();
+
             foreach (var requestProcessingState in processingContexts)
             {
-                if(exceptionsPreviouslyOccurred)
+                if (exceptionsPreviouslyOccurred)
                 {
                     errorHandler.DealWithPreviouslyOccurredExceptions(requestProcessingState);
                     continue;
                 }
+
                 IList<IRequestHandlerInterceptor> interceptors = new List<IRequestHandlerInterceptor>();
+                IList<IRequestHandlerInterceptor> invokedInterceptors = new List<IRequestHandlerInterceptor>();
+                
                 try
                 {
-                    IList<IRequestHandlerInterceptor> invokedInterceptors = new List<IRequestHandlerInterceptor>();
                     interceptors = ResolveInterceptors();
                     foreach (var interceptor in interceptors)
                     {
@@ -66,25 +69,38 @@ namespace Agatha.ServiceLayer
 
                     if (!requestProcessingState.IsProcessed)
                     {
-                        exceptionsPreviouslyOccurred = InvokeRequestHandler(requestProcessingState);
+                        InvokeRequestHandler(requestProcessingState);
                     }
-
-                    foreach (var interceptor in invokedInterceptors.Reverse())
-                    {
-                        interceptor.AfterHandlingRequest(requestProcessingState);
-                    }
-                    invokedInterceptors.Clear();
                 }
                 catch (Exception exc)
                 {
-                    logger.Error(exc);
-                    throw;
+                    logger.Error(exc.Message, exc);
+                    exceptionsPreviouslyOccurred = true;
+                    errorHandler.DealWithException(requestProcessingState, exc);
                 }
                 finally
                 {
-                    DisposeInterceptorsSafely(interceptors);
+                    try
+                    {
+                        var possibleExceptionsFromInterceptors = RunInvokedInterceptorsSafely(requestProcessingState, invokedInterceptors);
+
+                        if (possibleExceptionsFromInterceptors.Any())
+                        {
+                            foreach (var exceptionFromInterceptor in possibleExceptionsFromInterceptors)
+                            {
+                                logger.Error(exceptionFromInterceptor);
+                            }
+                            exceptionsPreviouslyOccurred = true;
+                            errorHandler.DealWithException(requestProcessingState, possibleExceptionsFromInterceptors.ElementAt(0));
+                        }
+                    }
+                    finally
+                    {
+                        DisposeInterceptorsSafely(interceptors);
+                    }
                 }
             }
+            
             var responses = processingContexts.Select(c => c.Response).ToArray();
 
             AfterProcessing(requests, responses);
@@ -92,29 +108,72 @@ namespace Agatha.ServiceLayer
             return responses;
         }
 
-        private bool InvokeRequestHandler(RequestProcessingContext requestProcessingState)
+        private void InvokeRequestHandler(RequestProcessingContext requestProcessingState)
+        {
+            BeforeResolvingRequestHandler(requestProcessingState.Request);
+            HandleRequest(requestProcessingState);
+        }
+
+        private void HandleRequest(RequestProcessingContext requestProcessingState)
         {
             var request = requestProcessingState.Request;
 
-            BeforeResolvingRequestHandler(request);
-
-            using (var handler = (IRequestHandler) IoC.Container.Resolve(GetRequestHandlerTypeFor(request)))
+            if (request is OneWayRequest)
             {
-                try
+                using (var handler = (IOneWayRequestHandler)IoC.Container.Resolve(GetOneWayRequestHandlerTypeFor(request)))
                 {
-                    var response = GetResponseFromHandler(request, handler);
-                    requestProcessingState.MarkAsProcessed(response);
-                    return response.ExceptionType != ExceptionType.None;
+                    try
+                    {
+                        ExecuteHandler((OneWayRequest)request, handler);
+                    }
+                    finally
+                    {
+                        IoC.Container.Release(handler);
+                    }
                 }
-                finally
+            }
+            else
+            {
+                using (var handler = (IRequestHandler)IoC.Container.Resolve(GetRequestHandlerTypeFor(request)))
                 {
-                    IoC.Container.Release(handler);
+                    try
+                    {
+                        var response = GetResponseFromHandler(request, handler);
+                        requestProcessingState.MarkAsProcessed(response);
+                    }
+                    finally
+                    {
+                        IoC.Container.Release(handler);
+                    }
                 }
             }
         }
 
+        private IEnumerable<Exception> RunInvokedInterceptorsSafely(RequestProcessingContext requestProcessingState, IList<IRequestHandlerInterceptor> invokedInterceptors)
+        {
+            var exceptionsFromInterceptor = new List<Exception>();
+            foreach (var interceptor in invokedInterceptors.Reverse())
+            {
+                try
+                {
+                    interceptor.AfterHandlingRequest(requestProcessingState);
+                }
+                catch (Exception exc)
+                {
+                    exceptionsFromInterceptor.Add(exc);
+                }
+            }
+
+            return exceptionsFromInterceptor;
+        }
+
         private void DisposeInterceptorsSafely(IList<IRequestHandlerInterceptor> interceptors)
         {
+            if (interceptors == null)
+            {
+                return;
+            }
+
             foreach (var interceptor in interceptors.Reverse())
             {
                 try
@@ -154,96 +213,17 @@ namespace Agatha.ServiceLayer
             catch (Exception e)
             {
                 OnHandlerException(request, e);
-                return CreateExceptionResponse(handler, e);
+                throw;
             }
         }
 
         protected virtual void OnHandlerException(Request request, Exception exception)
         {
-            logger.Error("RequestProcessor: unhandled exception while handling request!", exception);
-        }
-
-        protected virtual Response CreateExceptionResponse(IRequestHandler handler, Exception exception)
-        {
-            var response = handler.CreateDefaultResponse();
-            response.Exception = new ExceptionInfo(exception);
-            SetExceptionType(response, exception);
-            return response;
-        }
-
-        private void SetExceptionType(Response response, Exception exception)
-        {
-            var exceptionType = exception.GetType();
-
-            if (exceptionType.Equals(serviceLayerConfiguration.BusinessExceptionType))
-            {
-                response.ExceptionType = ExceptionType.Business;
-                SetExceptionFaultCode(exception, response.Exception);
-
-                return;
-            }
-
-            if (exceptionType.Equals(serviceLayerConfiguration.SecurityExceptionType))
-            {
-                response.ExceptionType = ExceptionType.Security;
-                SetExceptionFaultCode(exception, response.Exception);
-                return;
-            }
-
-            response.ExceptionType = ExceptionType.Unknown;
-        }
-
-        private void SetExceptionFaultCode(Exception exception, ExceptionInfo exceptionInfo)
-        {
-            var businessExceptionType = exception.GetType();
-
-            var faultCodeProperty = businessExceptionType.GetProperty("FaultCode");
-
-            if (faultCodeProperty != null
-                && faultCodeProperty.CanRead
-                && faultCodeProperty.PropertyType.Equals(typeof(string)))
-            {
-                exceptionInfo.FaultCode = (string)faultCodeProperty.GetValue(exception, null);
-            }
         }
 
         public void ProcessOneWayRequests(params OneWayRequest[] requests)
         {
-            if (requests == null) return;
-
-            BeforeProcessing(requests);
-
-            DispatchRequestsToHandlers(requests);
-
-            AfterProcessing(requests, null);
-        }
-
-        private void DispatchRequestsToHandlers(OneWayRequest[] requests)
-        {
-            foreach (var request in requests)
-            {
-                try
-                {
-                    BeforeResolvingRequestHandler(request);
-
-                    using (var handler = (IOneWayRequestHandler)IoC.Container.Resolve(GetOneWayRequestHandlerTypeFor(request)))
-                    {
-                        try
-                        {
-                            ExecuteHandler(request, handler);
-                        }
-                        finally
-                        {
-                            IoC.Container.Release(handler);
-                        }
-                    }
-                }
-                catch (Exception e)
-                {
-                    logger.Error(e);
-                    throw;
-                }
-            }
+            Process(requests);
         }
 
         private static Type GetOneWayRequestHandlerTypeFor(Request request)
@@ -262,12 +242,12 @@ namespace Agatha.ServiceLayer
             catch (Exception e)
             {
                 OnHandlerException(request, e);
+                throw;
             }
         }
 
         protected virtual void OnHandlerException(OneWayRequest request, Exception exception)
         {
-            logger.Error("RequestProcessor: unhandled exception while handling request!", exception);
         }
     }
 }
